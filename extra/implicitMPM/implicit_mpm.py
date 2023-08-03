@@ -6,13 +6,15 @@ ti.init(arch = ti.cpu)
 MATERIAL_PHASE_FLUID = 0
 MATERIAL_PHASE_SOLID = 1
 
+n_particles = 500
+
 @ti.data_oriented
 class IMPLICIT_MPM:
     def __init__(self,
-    category = MATERIAL_PHASE_SOLID, dim = 2, dt = 0.00004, n_particles = 5000,  n_grid = 128, gravity = 9.8, gravity_dim = 1,
-    p_rho = 1.0, E = 50000, nu = 0.4,
-    newton_max_iterations = 5, newton_tolerance = 1e-5, line_search = True, line_search_max_iterations = 10, linear_solve_tolerance_scale = 1,
-    linear_solve_max_iterations = 1000, linear_solve_tolerance = 1e-30,
+    category = MATERIAL_PHASE_SOLID, dim = 2, dt = 1e-3, n_grid = 64, gravity = 9.8, gravity_dim = 1,
+    p_rho = 1.0, E = 9e5, nu = 0.2,
+    newton_max_iterations = 1, newton_tolerance = 1e-2, line_search = True, line_search_max_iterations = 10, linear_solve_tolerance_scale = 1,
+    linear_solve_max_iterations = 1000, linear_solve_tolerance = 1e-6,
     cfl = 0.4, ppc = 16, 
     real = float,
     debug_mode = True,
@@ -183,7 +185,11 @@ class IMPLICIT_MPM:
     # [i, j]/[i, j, k] -> id
     @ti.func
     def idx(self, I):
-        return sum([I[i] * self.n_grid ** i for i in range(self.dim)])
+        sum = 0
+        for i in range(self.dim):
+            sum += I[i] * self.n_grid ** i
+        return sum
+        # return sum([I[i] * self.n_grid ** i for i in range(self.dim)])
 
     # id -> [i, j]/[i, j, k]
     @ti.func
@@ -395,9 +401,12 @@ class IMPLICIT_MPM:
         for I in ti.grouped(self.grid_m):
             if (self.grid_m[I] > 0):
                 node_id = self.idx(I)
-                if ti.static(not self.ignore_collision):
-                    cond = (I < self.bound and self.grid_v[I] < 0) or (I > self.n_grid - self.bound and self.grid_v[I] > 0)
-                    self.dv[node_id] = 0 if cond else self.gravity * self.dt
+                if not self.ignore_collision:
+                    # cond = any(I < self.bound and self.grid_v[I] < 0) or any(I > self.n_grid - self.bound and self.grid_v[I] > 0)
+                    # if cond:
+                    #     self.dv[node_id] = 0
+                    # else:
+                    self.dv[node_id] = self.gravity * self.dt
                 else:
                     self.dv[node_id] = self.gravity * self.dt # Newton initial guess for non-collided nodes
 
@@ -416,8 +425,10 @@ class IMPLICIT_MPM:
         for I in ti.grouped(self.grid_m):
             if self.grid_m[I] > 0:
                 self.grid_v[I] += self.dv[self.idx(I)]
-                cond = (I < self.bound and self.grid_v[I] < 0) or (I > self.n_grid - self.bound and self.grid_v[I] > 0)
-                self.grid_v[I] = 0 if cond else self.grid_v[I]
+                cond = any(I < self.bound and self.grid_v[I] < 0) or any(I > self.n_grid - self.bound and self.grid_v[I] > 0)
+                if cond:
+                    self.grid_v[I] = 0
+                # self.grid_v[I] = 0 if cond else self.grid_v[I]
 
     @ti.kernel
     def totalEnergy(self) -> ti.f32:
@@ -447,7 +458,7 @@ class IMPLICIT_MPM:
         for I in self.dv:
             self.residual[I] -= self.mass_matrix[I] * self.dv[I]
 
-        ti.block_dim(self.n_grid)
+        ti.loop_config(block_dim=self.n_grid)
         for p in self.x:
             Xp = self.x[p] * self.inv_dx
             base = int(Xp - 0.5)
@@ -489,7 +500,7 @@ class IMPLICIT_MPM:
 
     @ti.kernel
     def updateState(self):
-        ti.block_dim(self.n_grid)
+        ti.loop_config(block_dim=self.n_grid)
         for p in self.x:
             Xp = self.x[p] * self.inv_dx
             base = int(Xp - 0.5)
@@ -560,7 +571,7 @@ class IMPLICIT_MPM:
             self.computeStressDifferential(p, self.scratch_gradV[p], self.scratch_stress[p], self.scratch_vp[p])
             # scratch_stress is now V_p^0 dP (F_p^n)^T (dP is Ap in snow paper)
 
-        ti.block_dim(self.n_grid)
+        ti.loop_config(block_dim=self.n_grid)
         for p in self.x:
             Xp = self.x[p] * self.inv_dx
             base = int(Xp - 0.5)
@@ -703,7 +714,7 @@ class IMPLICIT_MPM:
 
     @ti.kernel
     def gridToParticles(self):
-        ti.block_dim(self.n_grid)
+        ti.loop_config(block_dim=self.n_grid)
         for p in self.x:
             Xp = self.x[p] * self.inv_dx
             base = int(Xp - 0.5)
@@ -733,7 +744,7 @@ class IMPLICIT_MPM:
         self.backwardEulerStep()
         self.gridToParticles()
 
-colors = ti.field(int, 5000)
+colors = ti.field(int, n_particles)
 @ti.kernel
 def init(solver : ti.template()):
     '''
@@ -751,10 +762,16 @@ def init(solver : ti.template()):
     '''
 
     for i in range(solver.n_particles):
-        solver.x[i] = ti.Vector([ti.random() for i in range(solver.dim)]) * 0.4 + 0.35
+        solver.x[i] = ti.Vector([ti.random() for i in range(solver.dim)]) * 0.3 + 0.35
         solver.v[i] = ti.Vector([0, -6])
         solver.F[i] = ti.Matrix.identity(solver.real, solver.dim)
         colors[i] = 0xED553B
+
+
+record_video = True
+result_dir = "./result"
+video_manager = ti.tools.VideoManager(output_dir=result_dir, framerate=30, automatic_build=False)
+
 
 if __name__ == '__main__':
     solver = IMPLICIT_MPM()
@@ -770,6 +787,11 @@ if __name__ == '__main__':
         pos = solver.x.to_numpy()
         gui.circles(pos, radius=1.5, color=colors.to_numpy())
         # gui.show(f'{frame:06d}.png')
+        
+        if record_video:
+            video_manager.write_frame(gui.get_image())
         gui.show()
 
         frame += 1
+    if record_video:
+        video_manager.make_video(gif=True, mp4=True)
